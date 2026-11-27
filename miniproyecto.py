@@ -514,26 +514,34 @@ def contar_parametros(ajustado):
 
 def fila(nombre, serie, modelo):
     ULTIMO.clear()
+    pronostico_final = None
+
+    def registrar(entrenamiento, h):
+        nonlocal pronostico_final
+        pronostico_final = modelo(entrenamiento, h)
+        return pronostico_final
+
     inicio = time.perf_counter()
-    _, promedio = backtest(serie, modelo)
+    _, promedio = backtest(serie, registrar)
     segundos = time.perf_counter() - inicio
     parametros = contar_parametros(ULTIMO["modelo"]) if "modelo" in ULTIMO else 0
     print(f"  {nombre}: RMSE {promedio['RMSE']:.2f} en {segundos:.1f} s")
-    return {"modelo": nombre, "RMSE": round(promedio["RMSE"], 2),
-            "MAE": round(promedio["MAE"], 2), "MAPE": round(promedio["MAPE"], 2),
-            "parametros": parametros, "segundos": round(segundos, 1)}
+    metricas = {"modelo": nombre, "RMSE": round(promedio["RMSE"], 2),
+                "MAE": round(promedio["MAE"], 2), "MAPE": round(promedio["MAPE"], 2),
+                "parametros": parametros, "segundos": round(segundos, 1)}
+    return metricas, pronostico_final
 
 
-def graficar_pronosticos(serie, modelos):
+def graficar_pronosticos(serie, pronosticos):
     """Pronóstico desde el último origen del backtest de cada modelo elegido."""
-    entrenamiento, real = serie.iloc[:-12], serie.iloc[-12:]
+    real = serie.iloc[-HORIZONTE:]
     figura, eje = plt.subplots(figsize=(9, 3.6))
     eje.plot(serie.index[-36:], serie.iloc[-36:].to_numpy(), color="black", label="real")
-    for nombre, modelo in modelos.items():
-        pronostico = modelo(entrenamiento, 12)
+    eje.axvline(serie.index[-HORIZONTE - 1], color="gray", linestyle="--", linewidth=1)
+    for nombre, pronostico in pronosticos.items():
         eje.plot(real.index, pronostico, marker="o", markersize=3,
                  label=f"{nombre} (RMSE {rmse(real, pronostico):.1f})")
-    eje.set_ylabel(VALOR)
+    eje.set_ylabel("Vehículos")
     eje.set_title("Pronóstico a 12 meses desde el último origen")
     eje.legend(fontsize=8)
     figura.tight_layout()
@@ -541,8 +549,17 @@ def graficar_pronosticos(serie, modelos):
     plt.close(figura)
 
 
-def pendiente(parte, error):
-    print(f"  pendiente: {parte} ({error})")
+def mostrar_mayor_error(serie, pronosticos):
+    """Identifica la mayor desviación absoluta de cada modelo en el último origen."""
+    real = serie.iloc[-HORIZONTE:]
+    filas = []
+    for nombre, pronostico in pronosticos.items():
+        error = (real - pronostico).abs()
+        mes = error.idxmax()
+        filas.append({"modelo": nombre, "mes": f"{mes:%Y-%m}", "real": real.loc[mes],
+                      "pronóstico": pronostico[real.index.get_loc(mes)], "error": error.loc[mes]})
+    print("Mayor error absoluto de cada modelo desde el último origen:")
+    print(pd.DataFrame(filas).round(2).to_string(index=False))
 
 
 def main():
@@ -552,59 +569,52 @@ def main():
           f"{cruda.index[-1]:%Y-%m}, {cruda.isna().sum()} vacíos")
     serie = preparar(cruda)
     graficar_serie(serie)
+    print(f"Backtest: {N_PRUEBA - HORIZONTE + 1} orígenes de "
+          f"{serie.index[-N_PRUEBA - 1]:%Y-%m} a {serie.index[-HORIZONTE - 1]:%Y-%m}, "
+          f"hasta {HORIZONTE} meses por origen. PyTorch en {DISPOSITIVO}.")
 
     print("1. Línea base y modelo a superar")
-    filas = [fila("estacional ingenuo", serie,
-                  lambda t, h: estacional_ingenuo(t, h, PERIODO))]
-    elegidos_para_figura = {}
-    try:
-        clasico = modelo_clasico(serie)
-        filas.append(fila(NOMBRE_CLASICO, serie, clasico))
-        elegidos_para_figura[NOMBRE_CLASICO] = clasico
-    except NotImplementedError as error:
-        pendiente("parte 1", error)
+    filas, pronosticos = [], {}
+
+    def evaluar(nombre, modelo):
+        metricas, ultimo = fila(nombre, serie, modelo)
+        filas.append(metricas)
+        pronosticos[nombre] = ultimo
+        return metricas
+
+    evaluar("estacional ingenuo", lambda t, h: estacional_ingenuo(t, h, PERIODO))
+    evaluar(NOMBRE_CLASICO, modelo_clasico(serie))
+    coeficiente = ULTIMO["modelo"].params["festivos"] * ESCALA
+    print(f"  Coeficiente de festivos en el último origen: {coeficiente:.2f} vehículos.")
 
     print("2. Tabla supervisada")
-    try:
-        comprobar_sin_fuga(serie)
-        tabla_lista = True
-    except NotImplementedError as error:
-        pendiente("parte 2", error)
-        tabla_lista = False
+    comprobar_sin_fuga(serie)
 
-    if tabla_lista:
-        print("3. Aprendizaje automático")
-        try:
-            elegidos = ajustar_hiperparametros(serie)
-            graficar_importancia(serie, elegidos)
-            modelos_aa = {nombre: con_tabla(lambda f=fabrica, p=elegidos[nombre]: f(**p))
-                          for nombre, (fabrica, _) in REJILLAS.items()}
-            filas_aa = [fila(nombre, serie, modelo) for nombre, modelo in modelos_aa.items()]
-            filas += filas_aa
-            mejor_aa = min(filas_aa, key=lambda f: f["RMSE"])["modelo"]
-            elegidos_para_figura[mejor_aa] = modelos_aa[mejor_aa]
-        except NotImplementedError as error:
-            pendiente("parte 3", error)
+    print("3. Aprendizaje automático")
+    elegidos = ajustar_hiperparametros(serie)
+    graficar_importancia(serie, elegidos)
+    modelos_aa = {nombre: con_tabla(lambda f=fabrica, p=elegidos[nombre]: f(**p))
+                  for nombre, (fabrica, _) in REJILLAS.items()}
+    filas_aa = [evaluar(nombre, modelo) for nombre, modelo in modelos_aa.items()]
+    mejor_aa = min(filas_aa, key=lambda f: f["RMSE"])["modelo"]
 
-        print("4. Aprendizaje profundo")
-        try:
-            epocas = validar_redes(serie)
-            filas_red = [fila(f"{nombre}, {e} épocas", serie, con_tabla(red(nombre, e)))
-                         for nombre, e in epocas.items()]
-            filas += filas_red
-            mejor = min(zip(epocas, filas_red), key=lambda par: par[1]["RMSE"])[0]
-            elegidos_para_figura[mejor] = con_tabla(red(mejor, epocas[mejor]))
-            repetir_con_semillas(serie, mejor, epocas[mejor])
-        except NotImplementedError as error:
-            pendiente("parte 4", error)
+    print("4. Aprendizaje profundo")
+    epocas = validar_redes(serie)
+    filas_red = {
+        nombre: evaluar(f"{nombre}, {e} épocas", con_tabla(red(nombre, e)))
+        for nombre, e in epocas.items()
+    }
+    mejor_red = min(filas_red, key=lambda nombre: filas_red[nombre]["RMSE"])
+    repetir_con_semillas(serie, mejor_red, epocas[mejor_red])
 
     print("5. La tabla")
     tabla = pd.DataFrame(filas).sort_values("RMSE")
     tabla.to_csv(RESULTADOS / "metricas.csv", index=False)
     print(tabla.to_string(index=False))
     print("Mejor modelo por RMSE:", tabla.iloc[0]["modelo"])
-    if len(elegidos_para_figura) > 1:
-        graficar_pronosticos(serie, elegidos_para_figura)
+    mostrar_mayor_error(serie, pronosticos)
+    comparar = (NOMBRE_CLASICO, mejor_aa, filas_red[mejor_red]["modelo"])
+    graficar_pronosticos(serie, {nombre: pronosticos[nombre] for nombre in comparar})
     print(f"Tiempo total: {time.perf_counter() - inicio:.0f} s")
 
 
